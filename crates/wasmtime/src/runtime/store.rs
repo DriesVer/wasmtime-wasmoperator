@@ -2827,3 +2827,76 @@ mod tests {
         assert_eq!(*store.data(), 3);
     }
 }
+
+impl<T> StoreInner<T> {
+    /// Bypasses internal module privacy to expose the linear memories of all core Wasm instances inside the store.
+    pub(crate) fn get_core_memories(&self) -> Vec<crate::Memory> {
+        let mut memories: Vec<crate::Memory> = Vec::new();
+
+        for id in self.instances.keys() {
+            let count = self.instance(id).env_module().num_defined_memories();
+            for idx in 0..count {
+                let instance_id = StoreInstanceId::new(self.id(), id);
+                let memory_index = wasmtime_environ::DefinedMemoryIndex::new(idx);
+                memories.push(unsafe { crate::Memory::from_raw(instance_id, memory_index) });
+            }
+        }
+        memories
+    }
+}
+
+impl<T> Store<T> {
+    /// Extracts the binary representation of the component's inner linear memory.
+    pub fn get_linear_memory(&mut self) -> Result<Vec<u8>> {
+        // Get all the core memories of the store as a vector
+        let StoreContextMut(store_inner) = self.as_context_mut();
+        let memories = store_inner.get_core_memories();
+
+        // Convert each memory to a binary representation Vec<u8>
+        let memories: Vec<Vec<u8>> = memories
+            .into_iter()
+            .map(|m| m.data(self.as_context_mut()).to_vec())
+            .collect();
+
+        // Convert the vector of memory snapshots into a single binary representation
+        postcard::to_allocvec(&memories).context("Failed to serialize linear memory of store.")
+    }
+
+    /// Restores the linear memory of the component from a binary snapshot created by [`Instance::get_memory`].
+    pub fn set_linear_memory(&mut self, snapshot: &[u8]) -> crate::Result<()> {
+        // Deserialize the snapshot into a vector of memory snapshots
+        let snapshots: Vec<&[u8]> = postcard::from_bytes(snapshot)
+            .context("Failed to deserialize linear memory snapshot.")?;
+
+        // Verify that the number of snapshots matches the number of memories in the store
+        let memories = self.as_context_mut().0.get_core_memories();
+        if memories.len() != snapshots.len() {
+            return Err(crate::Error::msg(format!(
+                "Snapshot count mismatch: store has {} memories, but snapshot contains {}",
+                memories.len(),
+                snapshots.len()
+            )));
+        }
+
+        // Restore every memory from their corresponding snapshot
+        for (memory, snapshot) in memories.into_iter().zip(snapshots.iter()) {
+            let curr_mem_len = memory.data_size(self.as_context_mut());
+
+            // If the incoming state snapshot is larger than current memory, grow it.
+            if snapshot.len() > curr_mem_len {
+                let diff = snapshot.len() - curr_mem_len;
+                let pages_needed = (diff + 65535) / 65536;
+
+                memory
+                    .grow(self.as_context_mut(), pages_needed as u64)
+                    .context("Failed to grow linear memory when applying a snapshot")?;
+            }
+
+            // Overwrite the linear memory with the snapshot
+            let data = memory.data_mut(self.as_context_mut());
+            data[..snapshot.len()].copy_from_slice(snapshot);
+        }
+
+        Ok(())
+    }
+}
