@@ -971,7 +971,7 @@ fn pre_instantiate_raw(
     // we can. For more comments on this see `typecheck_externs`.
     let (modules, engine, breakpoints) = store.modules_and_engine_and_breakpoints_mut();
     modules.register_module(module, engine, breakpoints)?;
-    let (funcrefs, modules) = store.func_refs_and_modules();
+    let (funcrefs, modules, registry) = store.funcrefs_modules_registry();
     funcrefs.fill(modules);
 
     if host_funcs > 0 {
@@ -986,7 +986,7 @@ fn pre_instantiate_raw(
         // items into the store once. This avoids cloning each individual item
         // below.
         funcrefs.push_instance_pre_definitions(items.clone())?;
-        funcrefs.push_instance_pre_func_refs(func_refs.clone())?;
+        funcrefs.push_instance_pre_func_refs(func_refs.clone(), registry)?;
     }
 
     store.set_async_required(asyncness);

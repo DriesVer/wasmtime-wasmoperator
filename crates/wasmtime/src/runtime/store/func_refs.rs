@@ -91,6 +91,7 @@ impl FuncRefs {
         &mut self,
         func_ref: VMFuncRef,
         modules: &ModuleRegistry,
+        registry: &mut crate::runtime::store::FuncRefRegistry,
     ) -> Result<NonNull<VMFuncRef>, OutOfMemory> {
         debug_assert!(func_ref.wasm_call.is_none());
         let func_ref = self
@@ -105,6 +106,7 @@ impl FuncRefs {
         if has_hole {
             self.with_holes.push(unpatched)?;
         }
+        registry.register(unpatched.as_ptr() as *mut core::ffi::c_void);
         Ok(unpatched.as_non_null())
     }
 
@@ -126,7 +128,11 @@ impl FuncRefs {
     pub fn push_instance_pre_func_refs(
         &mut self,
         funcs: Arc<TryVec<VMFuncRef>>,
+        registry: &mut crate::runtime::store::FuncRefRegistry,
     ) -> Result<(), OutOfMemory> {
+        for func in funcs.iter() {
+            registry.register(func as *const _ as *mut core::ffi::c_void);
+        }
         self.storage.push(Storage::InstancePreFuncRefs { funcs })
     }
 
@@ -158,10 +164,11 @@ impl FuncRefs {
         &mut self,
         func: Arc<HostFunc>,
         modules: &ModuleRegistry,
+        registry: &mut crate::runtime::store::FuncRefRegistry,
     ) -> Result<NonNull<VMFuncRef>, OutOfMemory> {
         debug_assert!(func.func_ref().wasm_call.is_none());
         // SAFETY: the vmctx field in the funcref of `HostFunc` is safe to read.
-        let ret = unsafe { self.push(func.func_ref().clone(), modules)? };
+        let ret = unsafe { self.push(func.func_ref().clone(), modules, registry)? };
         self.storage.push(Storage::ArcHost { func })?;
         Ok(ret)
     }
@@ -171,10 +178,11 @@ impl FuncRefs {
         &mut self,
         func: Box<HostFunc>,
         modules: &ModuleRegistry,
+        registry: &mut crate::runtime::store::FuncRefRegistry,
     ) -> Result<NonNull<VMFuncRef>, OutOfMemory> {
         debug_assert!(func.func_ref().wasm_call.is_none());
         // SAFETY: the vmctx field in the funcref of `HostFunc` is safe to read.
-        let ret = unsafe { self.push(func.func_ref().clone(), modules)? };
+        let ret = unsafe { self.push(func.func_ref().clone(), modules, registry)? };
         self.storage.push(Storage::BoxHost { func })?;
         Ok(ret)
     }

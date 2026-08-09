@@ -2695,8 +2695,8 @@ impl HostFunc {
     /// this `HostFunc` was first created.
     pub unsafe fn to_func(self: &Arc<Self>, store: &mut StoreOpaque) -> Result<Func, OutOfMemory> {
         self.validate_store(store);
-        let (funcrefs, modules) = store.func_refs_and_modules();
-        let funcref = funcrefs.push_arc_host(self.clone(), modules)?;
+        let (funcrefs, modules, registry) = store.funcrefs_modules_registry();
+        let funcref = funcrefs.push_arc_host(self.clone(), modules, registry)?;
         // SAFETY: this funcref was just pushed within the store, so it's safe
         // to say this store owns it.
         Ok(unsafe { Func::from_vm_func_ref(store.id(), funcref) })
@@ -2760,8 +2760,8 @@ impl HostFunc {
         // fibers, so the store now required async entrypoints.
         store.set_async_required(self.asyncness);
 
-        let (funcrefs, modules) = store.func_refs_and_modules();
-        let funcref = funcrefs.push_box_host(try_new::<Box<_>>(self)?, modules)?;
+        let (funcrefs, modules, registry) = store.funcrefs_modules_registry();
+        let funcref = funcrefs.push_box_host(try_new::<Box<_>>(self)?, modules, registry)?;
         // SAFETY: this funcref was just pushed within `store`, so it's safe to
         // say it's owned by the store's id.
         Ok(unsafe { Func::from_vm_func_ref(store.id(), funcref) })

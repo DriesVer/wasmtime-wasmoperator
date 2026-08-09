@@ -82,6 +82,7 @@ use crate::error::OutOfMemory;
 use crate::fiber;
 use crate::module::{RegisterBreakpointState, RegisteredModuleId};
 use crate::prelude::*;
+use wasmtime_environ::packed_option::ReservedValue;
 #[cfg(feature = "gc")]
 use crate::runtime::vm::GcRootsList;
 #[cfg(feature = "stack-switching")]
@@ -431,12 +432,41 @@ impl<T> DerefMut for StoreInner<T> {
     }
 }
 
+pub struct FuncRefRegistry {
+    pub raw_to_index: std::collections::HashMap<usize, u64>,
+    pub index_to_raw: std::collections::HashMap<u64, usize>,
+    pub next_index: u64,
+}
+
+impl Default for FuncRefRegistry {
+    fn default() -> Self {
+        Self {
+            raw_to_index: Default::default(),
+            index_to_raw: Default::default(),
+            next_index: 1, // 0 is reserved for null pointers
+        }
+    }
+}
+
+impl FuncRefRegistry {
+    pub fn register(&mut self, ptr: *mut core::ffi::c_void) {
+        let addr = ptr as usize;
+        if addr != 0 && !self.raw_to_index.contains_key(&addr) {
+            let idx = self.next_index;
+            self.next_index += 1;
+            self.raw_to_index.insert(addr, idx);
+            self.index_to_raw.insert(idx, addr);
+        }
+    }
+}
+
 /// Monomorphic storage for a `Store<T>`.
 ///
 /// This structure contains the bulk of the metadata about a `Store`. This is
 /// used internally in Wasmtime when dependence on the `T` of `Store<T>` isn't
 /// necessary, allowing code to be monomorphic and compiled into the `wasmtime`
 /// crate itself.
+
 pub struct StoreOpaque {
     // This `StoreOpaque` structure has references to itself. These aren't
     // immediately evident, however, so we need to tell the compiler that it
@@ -474,6 +504,7 @@ pub struct StoreOpaque {
     signal_handler: Option<SignalHandler>,
     modules: ModuleRegistry,
     func_refs: FuncRefs,
+    pub(crate) funcref_registry: FuncRefRegistry,
     host_globals: TryPrimaryMap<DefinedGlobalIndex, StoreBox<VMHostGlobalContext>>,
     // GC-related fields.
     gc_store: Option<GcStore>,
@@ -762,6 +793,7 @@ impl<T> Store<T> {
             pending_exception: None,
             modules: ModuleRegistry::default(),
             func_refs: FuncRefs::default(),
+            funcref_registry: FuncRefRegistry::default(),
             host_globals: TryPrimaryMap::new(),
             instance_count: 0,
             instance_limit: crate::DEFAULT_INSTANCE_LIMIT,
@@ -1610,8 +1642,50 @@ impl StoreOpaque {
         (&mut self.modules, &self.engine, breakpoints)
     }
 
+    pub(crate) fn register_all_wasm_funcrefs(&mut self) {
+        let mut instance_ids: Vec<_> = self.instances.keys().collect();
+        instance_ids.sort_by_key(|id| id.as_u32()); // Deterministic order
+
+        for id in instance_ids {
+            let (num_funcs, env_module) = match self.instances[id].kind {
+                StoreInstanceKind::Dummy => continue,
+                StoreInstanceKind::Real { module_id } => {
+                    let module = self
+                        .modules
+                        .module_by_id(module_id)
+                        .expect("should always have a registered module for real instances");
+                    (module.env_module().functions.len(), module.env_module())
+                }
+            };
+
+            for func_idx in 0..num_funcs {
+                let func_index = wasmtime_environ::FuncIndex::from_u32(func_idx as u32);
+                
+                // Skip functions that do not have an escaped funcref, as `get_func_ref` would panic.
+                if env_module.functions[func_index].func_ref.is_reserved_value() {
+                    continue;
+                }
+
+                let func_ref = self.instances[id].handle.get_mut().get_func_ref(&self.modules, func_index);
+                if let Some(func_ref) = func_ref {
+                    self.funcref_registry.register(func_ref.as_ptr().cast::<core::ffi::c_void>());
+                }
+            }
+        }
+    }
+
     pub(crate) fn func_refs_and_modules(&mut self) -> (&mut FuncRefs, &ModuleRegistry) {
         (&mut self.func_refs, &self.modules)
+    }
+
+    pub(crate) fn funcrefs_modules_registry(
+        &mut self,
+    ) -> (&mut FuncRefs, &ModuleRegistry, &mut FuncRefRegistry) {
+        (
+            &mut self.func_refs,
+            &self.modules,
+            &mut self.funcref_registry,
+        )
     }
 
     pub(crate) fn host_globals(
@@ -2843,6 +2917,43 @@ impl<T> StoreInner<T> {
         }
         memories
     }
+
+    /// Bypasses internal module privacy to expose the globals of all core Wasm instances inside the store.
+    pub(crate) fn get_core_globals(&self) -> Vec<crate::Global> {
+        let mut globals: Vec<crate::Global> = Vec::new();
+
+        for id in self.instances.keys() {
+            let count = self.instance(id).env_module().num_defined_globals();
+            for idx in 0..count {
+                let instance_id = StoreInstanceId::new(self.id(), id);
+                let global_index = wasmtime_environ::DefinedGlobalIndex::new(idx);
+                globals.push(crate::Global::from_core(instance_id, global_index));
+            }
+        }
+        globals
+    }
+
+    /// Bypasses internal module privacy to expose the tables of all core Wasm instances inside the store.
+    pub(crate) fn get_core_tables(&self) -> Vec<crate::Table> {
+        let mut tables: Vec<crate::Table> = Vec::new();
+
+        for id in self.instances.keys() {
+            let count = self.instance(id).env_module().num_defined_tables();
+            for idx in 0..count {
+                let instance_id = StoreInstanceId::new(self.id(), id);
+                let table_index = wasmtime_environ::DefinedTableIndex::new(idx);
+                tables.push(crate::Table::from_raw(instance_id, table_index));
+            }
+        }
+        tables
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoreSnapshot {
+    linear_memory: Vec<u8>,
+    globals: Vec<u8>,
+    tables: Vec<u8>,
 }
 
 impl<T> Store<T> {
@@ -2898,5 +3009,222 @@ impl<T> Store<T> {
         }
 
         Ok(())
+    }
+
+    /// Extracts the binary representation of the component's inner tables.
+    pub fn get_tables(&mut self) -> Result<Vec<u8>> {
+        let StoreContextMut(store_inner) = self.as_context_mut();
+        let tables = store_inner.get_core_tables();
+
+        let table_vals: Vec<Vec<ValSnapshot>> = tables
+            .into_iter()
+            .map(|t| {
+                let size = t.size(self.as_context_mut());
+                let mut vals = Vec::with_capacity(size as usize);
+                for i in 0..size {
+                    // Ref elements in tables can be extracted
+                    let val = t.get(self.as_context_mut(), i).unwrap();
+                    vals.push(ValSnapshot::from_val(
+                        self.as_context_mut(),
+                        crate::Val::from(val),
+                    ));
+                }
+                vals
+            })
+            .collect();
+
+        postcard::to_allocvec(&table_vals).context("Failed to serialize tables of store.")
+    }
+
+    /// Restores the tables of the component from a binary snapshot created by [`Store::get_tables`].
+    pub fn set_tables(&mut self, snapshot: &[u8]) -> crate::Result<()> {
+        let snapshots: Vec<Vec<ValSnapshot>> =
+            postcard::from_bytes(snapshot).context("Failed to deserialize tables snapshot.")?;
+
+        let tables = self.as_context_mut().0.get_core_tables();
+        if tables.len() != snapshots.len() {
+            return Err(crate::Error::msg(format!(
+                "Snapshot count mismatch: store has {} tables, but snapshot contains {}",
+                tables.len(),
+                snapshots.len()
+            )));
+        }
+
+        for (table, snapshot_vals) in tables.into_iter().zip(snapshots.into_iter()) {
+            let curr_size = table.size(self.as_context_mut());
+            let snapshot_size = snapshot_vals.len() as u64;
+            let ty = table.ty(self.as_context_mut());
+
+            if snapshot_size > curr_size {
+                let delta = snapshot_size - curr_size;
+                let null_ref = crate::Ref::null(ty.element().heap_type());
+                table
+                    .grow(self.as_context_mut(), delta, null_ref)
+                    .context("Failed to grow table when applying a snapshot")?;
+            }
+
+            for (i, snapshot_val) in snapshot_vals.into_iter().enumerate() {
+                let val = snapshot_val.to_val(self.as_context_mut(), ty.element().clone().into());
+                table
+                    .set(self.as_context_mut(), i as u64, val.ref_().unwrap())
+                    .context("Failed to set table element")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Extracts the binary representation of the component's inner globals.
+    pub fn get_globals(&mut self) -> Result<Vec<u8>> {
+        let StoreContextMut(store_inner) = self.as_context_mut();
+        let globals = store_inner.get_core_globals();
+
+        let globals_vals: Vec<ValSnapshot> = globals
+            .into_iter()
+            .map(|g| {
+                let val = g.get(self.as_context_mut());
+                ValSnapshot::from_val(self.as_context_mut(), val)
+            })
+            .collect();
+
+        postcard::to_allocvec(&globals_vals).context("Failed to serialize globals of store.")
+    }
+
+    /// Restores the globals of the component from a binary snapshot created by [`Store::get_globals`].
+    pub fn set_globals(&mut self, snapshot: &[u8]) -> crate::Result<()> {
+        let snapshots: Vec<ValSnapshot> =
+            postcard::from_bytes(snapshot).context("Failed to deserialize globals snapshot.")?;
+
+        let globals = self.as_context_mut().0.get_core_globals();
+        if globals.len() != snapshots.len() {
+            return Err(crate::Error::msg(format!(
+                "Snapshot count mismatch: store has {} globals, but snapshot contains {}",
+                globals.len(),
+                snapshots.len()
+            )));
+        }
+
+        for (global, snapshot) in globals.into_iter().zip(snapshots.into_iter()) {
+            if global.ty(self.as_context_mut()).mutability() == crate::Mutability::Var {
+                let ty = global.ty(self.as_context_mut()).content().clone();
+                let val = snapshot.to_val(self.as_context_mut(), ty);
+                global
+                    .set(self.as_context_mut(), val)
+                    .context("Failed to apply global snapshot")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Takes a binary snapshot of the store's linear memory and globals, returning it as a `Vec<u8>`.
+    pub fn get_snapshot(&mut self) -> Result<Vec<u8>> {
+        self.as_context_mut().0.register_all_wasm_funcrefs();
+        
+        // TODO: make the snapshot include the structs directly instead of serializing them separately, to avoid double serialization.
+        let linear_memory = self.get_linear_memory()?;
+        let globals = self.get_globals()?;
+        let tables = self.get_tables()?;
+
+        let snapshot = StoreSnapshot {
+            linear_memory,
+            globals,
+            tables,
+        };
+
+        postcard::to_allocvec(&snapshot).context("Failed to serialize store snapshot.")
+    }
+
+    /// Restores the store's linear memory and globals from a binary snapshot created by [`Store::get_snapshot`].
+    pub fn set_snapshot(&mut self, snapshot: &[u8]) -> crate::Result<()> {
+        self.as_context_mut().0.register_all_wasm_funcrefs();
+
+        let snapshot: StoreSnapshot =
+            postcard::from_bytes(snapshot).context("Failed to deserialize store snapshot.")?;
+
+        self.set_linear_memory(&snapshot.linear_memory)
+            .context("Failed to restore linear memory from snapshot")?;
+        self.set_globals(&snapshot.globals)
+            .context("Failed to restore globals from snapshot")?;
+        self.set_tables(&snapshot.tables)
+            .context("Failed to restore tables from snapshot")?;
+
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+enum ValSnapshot {
+    I32(i32),
+    I64(i64),
+    F32(u32),
+    F64(u64),
+    V128([u8; 16]),
+    FuncRef(u64),
+    ExternRef(u32),
+    AnyRef(u32),
+}
+
+impl ValSnapshot {
+    fn from_val(mut store: impl crate::AsContextMut, v: crate::Val) -> Self {
+        match v {
+            crate::Val::I32(x) => Self::I32(x),
+            crate::Val::I64(x) => Self::I64(x),
+            crate::Val::F32(x) => Self::F32(x),
+            crate::Val::F64(x) => Self::F64(x),
+            crate::Val::V128(x) => Self::V128(x.as_u128().to_le_bytes()),
+            crate::Val::FuncRef(_) => {
+                let raw = v.to_raw(store.as_context_mut()).unwrap();
+                let ptr = raw.get_funcref();
+                let idx = store
+                    .as_context_mut()
+                    .0
+                    .funcref_registry
+                    .raw_to_index
+                    .get(&(ptr as usize))
+                    .copied()
+                    .unwrap_or(0); // Assuming 0 or gracefully handling
+                Self::FuncRef(idx)
+            }
+            crate::Val::ExternRef(_) => {
+                let raw = v.to_raw(store).unwrap();
+                Self::ExternRef(raw.get_externref())
+            }
+            crate::Val::AnyRef(_) => {
+                let raw = v.to_raw(store).unwrap();
+                Self::AnyRef(raw.get_anyref())
+            }
+            _ => unimplemented!("Snapshotting of this global type is not supported"),
+        }
+    }
+
+    fn to_val(&self, mut store: impl crate::AsContextMut, ty: crate::ValType) -> crate::Val {
+        match self {
+            Self::I32(x) => crate::Val::I32(*x),
+            Self::I64(x) => crate::Val::I64(*x),
+            Self::F32(x) => crate::Val::F32(*x),
+            Self::F64(x) => crate::Val::F64(*x),
+            Self::V128(x) => crate::Val::V128(crate::V128::from(u128::from_le_bytes(*x))),
+            Self::FuncRef(idx) => {
+                let ptr = store
+                    .as_context_mut()
+                    .0
+                    .funcref_registry
+                    .index_to_raw
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(0);
+                let raw = crate::runtime::vm::ValRaw::funcref(ptr as *mut core::ffi::c_void);
+                unsafe { crate::Val::from_raw(store, raw, ty) }
+            }
+            Self::ExternRef(x) => {
+                let raw = crate::runtime::vm::ValRaw::externref(*x);
+                unsafe { crate::Val::from_raw(store, raw, ty) }
+            }
+            Self::AnyRef(x) => {
+                let raw = crate::runtime::vm::ValRaw::anyref(*x);
+                unsafe { crate::Val::from_raw(store, raw, ty) }
+            }
+        }
     }
 }
