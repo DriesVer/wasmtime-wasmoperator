@@ -82,7 +82,6 @@ use crate::error::OutOfMemory;
 use crate::fiber;
 use crate::module::{RegisterBreakpointState, RegisteredModuleId};
 use crate::prelude::*;
-use wasmtime_environ::packed_option::ReservedValue;
 #[cfg(feature = "gc")]
 use crate::runtime::vm::GcRootsList;
 #[cfg(feature = "stack-switching")]
@@ -111,6 +110,7 @@ use core::pin::Pin;
 use core::ptr::NonNull;
 #[cfg(any(feature = "async", feature = "gc"))]
 use core::task::Poll;
+use wasmtime_environ::packed_option::ReservedValue;
 use wasmtime_environ::{DefinedGlobalIndex, DefinedTableIndex, EntityRef, TripleExt};
 
 mod context;
@@ -1660,15 +1660,22 @@ impl StoreOpaque {
 
             for func_idx in 0..num_funcs {
                 let func_index = wasmtime_environ::FuncIndex::from_u32(func_idx as u32);
-                
+
                 // Skip functions that do not have an escaped funcref, as `get_func_ref` would panic.
-                if env_module.functions[func_index].func_ref.is_reserved_value() {
+                if env_module.functions[func_index]
+                    .func_ref
+                    .is_reserved_value()
+                {
                     continue;
                 }
 
-                let func_ref = self.instances[id].handle.get_mut().get_func_ref(&self.modules, func_index);
+                let func_ref = self.instances[id]
+                    .handle
+                    .get_mut()
+                    .get_func_ref(&self.modules, func_index);
                 if let Some(func_ref) = func_ref {
-                    self.funcref_registry.register(func_ref.as_ptr().cast::<core::ffi::c_void>());
+                    self.funcref_registry
+                        .register(func_ref.as_ptr().cast::<core::ffi::c_void>());
                 }
             }
         }
@@ -2951,14 +2958,14 @@ impl<T> StoreInner<T> {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoreSnapshot {
-    linear_memory: Vec<u8>,
-    globals: Vec<u8>,
-    tables: Vec<u8>,
+    linear_memory: Vec<Vec<u8>>,
+    globals: Vec<ValSnapshot>,
+    tables: Vec<Vec<ValSnapshot>>,
 }
 
 impl<T> Store<T> {
     /// Extracts the binary representation of the component's inner linear memory.
-    pub fn get_linear_memory(&mut self) -> Result<Vec<u8>> {
+    fn get_linear_memory(&mut self) -> Result<Vec<Vec<u8>>> {
         // Get all the core memories of the store as a vector
         let StoreContextMut(store_inner) = self.as_context_mut();
         let memories = store_inner.get_core_memories();
@@ -2968,17 +2975,11 @@ impl<T> Store<T> {
             .into_iter()
             .map(|m| m.data(self.as_context_mut()).to_vec())
             .collect();
-
-        // Convert the vector of memory snapshots into a single binary representation
-        postcard::to_allocvec(&memories).context("Failed to serialize linear memory of store.")
+        Ok(memories)
     }
 
     /// Restores the linear memory of the component from a binary snapshot created by [`Instance::get_memory`].
-    pub fn set_linear_memory(&mut self, snapshot: &[u8]) -> crate::Result<()> {
-        // Deserialize the snapshot into a vector of memory snapshots
-        let snapshots: Vec<&[u8]> = postcard::from_bytes(snapshot)
-            .context("Failed to deserialize linear memory snapshot.")?;
-
+    fn set_linear_memory(&mut self, snapshots: Vec<Vec<u8>>) -> crate::Result<()> {
         // Verify that the number of snapshots matches the number of memories in the store
         let memories = self.as_context_mut().0.get_core_memories();
         if memories.len() != snapshots.len() {
@@ -3012,7 +3013,7 @@ impl<T> Store<T> {
     }
 
     /// Extracts the binary representation of the component's inner tables.
-    pub fn get_tables(&mut self) -> Result<Vec<u8>> {
+    fn get_tables(&mut self) -> Result<Vec<Vec<ValSnapshot>>> {
         let StoreContextMut(store_inner) = self.as_context_mut();
         let tables = store_inner.get_core_tables();
 
@@ -3033,14 +3034,11 @@ impl<T> Store<T> {
             })
             .collect();
 
-        postcard::to_allocvec(&table_vals).context("Failed to serialize tables of store.")
+        Ok(table_vals)
     }
 
     /// Restores the tables of the component from a binary snapshot created by [`Store::get_tables`].
-    pub fn set_tables(&mut self, snapshot: &[u8]) -> crate::Result<()> {
-        let snapshots: Vec<Vec<ValSnapshot>> =
-            postcard::from_bytes(snapshot).context("Failed to deserialize tables snapshot.")?;
-
+    fn set_tables(&mut self, snapshots: Vec<Vec<ValSnapshot>>) -> crate::Result<()> {
         let tables = self.as_context_mut().0.get_core_tables();
         if tables.len() != snapshots.len() {
             return Err(crate::Error::msg(format!(
@@ -3075,7 +3073,7 @@ impl<T> Store<T> {
     }
 
     /// Extracts the binary representation of the component's inner globals.
-    pub fn get_globals(&mut self) -> Result<Vec<u8>> {
+    fn get_globals(&mut self) -> Result<Vec<ValSnapshot>> {
         let StoreContextMut(store_inner) = self.as_context_mut();
         let globals = store_inner.get_core_globals();
 
@@ -3087,13 +3085,13 @@ impl<T> Store<T> {
             })
             .collect();
 
-        postcard::to_allocvec(&globals_vals).context("Failed to serialize globals of store.")
+        Ok(globals_vals)
     }
 
     /// Restores the globals of the component from a binary snapshot created by [`Store::get_globals`].
-    pub fn set_globals(&mut self, snapshot: &[u8]) -> crate::Result<()> {
-        let snapshots: Vec<ValSnapshot> =
-            postcard::from_bytes(snapshot).context("Failed to deserialize globals snapshot.")?;
+    fn set_globals(&mut self, snapshots: Vec<ValSnapshot>) -> crate::Result<()> {
+        // let snapshots: Vec<ValSnapshot> =
+        //     postcard::from_bytes(snapshot).context("Failed to deserialize globals snapshot.")?;
 
         let globals = self.as_context_mut().0.get_core_globals();
         if globals.len() != snapshots.len() {
@@ -3120,8 +3118,7 @@ impl<T> Store<T> {
     /// Takes a binary snapshot of the store's linear memory and globals, returning it as a `Vec<u8>`.
     pub fn get_snapshot(&mut self) -> Result<Vec<u8>> {
         self.as_context_mut().0.register_all_wasm_funcrefs();
-        
-        // TODO: make the snapshot include the structs directly instead of serializing them separately, to avoid double serialization.
+
         let linear_memory = self.get_linear_memory()?;
         let globals = self.get_globals()?;
         let tables = self.get_tables()?;
@@ -3142,11 +3139,11 @@ impl<T> Store<T> {
         let snapshot: StoreSnapshot =
             postcard::from_bytes(snapshot).context("Failed to deserialize store snapshot.")?;
 
-        self.set_linear_memory(&snapshot.linear_memory)
+        self.set_linear_memory(snapshot.linear_memory)
             .context("Failed to restore linear memory from snapshot")?;
-        self.set_globals(&snapshot.globals)
+        self.set_globals(snapshot.globals)
             .context("Failed to restore globals from snapshot")?;
-        self.set_tables(&snapshot.tables)
+        self.set_tables(snapshot.tables)
             .context("Failed to restore tables from snapshot")?;
 
         Ok(())
