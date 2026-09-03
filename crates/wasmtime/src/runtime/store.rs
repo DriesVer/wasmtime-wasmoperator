@@ -2957,29 +2957,25 @@ impl<T> StoreInner<T> {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct StoreSnapshot {
-    linear_memory: Vec<Vec<u8>>,
+struct StoreSnapshotRef<'a> {
+    #[serde(borrow)]
+    linear_memory: Vec<&'a [u8]>,
     globals: Vec<ValSnapshot>,
     tables: Vec<Vec<ValSnapshot>>,
 }
 
 impl<T> Store<T> {
-    /// Extracts the binary representation of the component's inner linear memory.
-    fn get_linear_memory(&mut self) -> Result<Vec<Vec<u8>>> {
-        // Get all the core memories of the store as a vector
-        let StoreContextMut(store_inner) = self.as_context_mut();
-        let memories = store_inner.get_core_memories();
-
-        // Convert each memory to a binary representation Vec<u8>
-        let memories: Vec<Vec<u8>> = memories
-            .into_iter()
-            .map(|m| m.data(self.as_context_mut()).to_vec())
-            .collect();
-        Ok(memories)
+    fn get_linear_memory(&self) -> Result<Vec<&[u8]>> {
+        let StoreContext(store_inner) = self.as_context();
+        let mut memories_data = Vec::new();
+        for m in store_inner.get_core_memories() {
+            memories_data.push(m.data(self.as_context()));
+        }
+        Ok(memories_data)
     }
 
     /// Restores the linear memory of the component from a binary snapshot created by [`Instance::get_memory`].
-    fn set_linear_memory(&mut self, snapshots: Vec<Vec<u8>>) -> crate::Result<()> {
+    fn set_linear_memory(&mut self, snapshots: Vec<&[u8]>) -> crate::Result<()> {
         // Verify that the number of snapshots matches the number of memories in the store
         let memories = self.as_context_mut().0.get_core_memories();
         if memories.len() != snapshots.len() {
@@ -3115,28 +3111,37 @@ impl<T> Store<T> {
         Ok(())
     }
 
-    /// Takes a binary snapshot of the store's linear memory and globals, returning it as a `Vec<u8>`.
-    pub fn get_snapshot(&mut self) -> Result<Vec<u8>> {
+    /// Streams a binary snapshot of the store's linear memory, globals, and tables to a writer.
+    pub fn snapshot_to_writer(&mut self, writer: impl std::io::Write) -> Result<()> {
         self.as_context_mut().0.register_all_wasm_funcrefs();
 
-        let linear_memory = self.get_linear_memory()?;
         let globals = self.get_globals()?;
         let tables = self.get_tables()?;
+        let linear_memory = self.get_linear_memory()?;
 
-        let snapshot = StoreSnapshot {
+        let snapshot = StoreSnapshotRef {
             linear_memory,
             globals,
             tables,
         };
 
-        postcard::to_allocvec(&snapshot).context("Failed to serialize store snapshot.")
+        postcard::to_io(&snapshot, writer)
+            .map(|_| ())
+            .context("Failed to stream store snapshot to writer.")
+    }
+
+    /// Takes a binary snapshot of the store's linear memory and globals, returning it as a `Vec<u8>`.
+    pub fn get_snapshot(&mut self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.snapshot_to_writer(&mut buf)?;
+        Ok(buf)
     }
 
     /// Restores the store's linear memory and globals from a binary snapshot created by [`Store::get_snapshot`].
     pub fn set_snapshot(&mut self, snapshot: &[u8]) -> crate::Result<()> {
         self.as_context_mut().0.register_all_wasm_funcrefs();
 
-        let snapshot: StoreSnapshot =
+        let snapshot: StoreSnapshotRef =
             postcard::from_bytes(snapshot).context("Failed to deserialize store snapshot.")?;
 
         self.set_linear_memory(snapshot.linear_memory)
@@ -3191,7 +3196,7 @@ impl ValSnapshot {
                 let raw = v.to_raw(store).unwrap();
                 Self::AnyRef(raw.get_anyref())
             }
-            _ => unimplemented!("Snapshotting of this global type is not supported"),
+            _ => unimplemented!("Snapshotting of this type is not supported"),
         }
     }
 
